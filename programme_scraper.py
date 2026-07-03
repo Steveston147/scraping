@@ -63,6 +63,9 @@ RUN_LOG_COLUMNS = [
     "Candidate Pages Found", "Programmes Extracted", "Error Message",
     "Run DateTime",
 ]
+SHEET_CANDIDATE_PAGES = "Candidate Pages"
+SHEET_EXTRACTED_PROGRAMMES = "Extracted Programmes"
+SHEET_RUN_LOG = "Run Log"
 
 
 @dataclass
@@ -350,9 +353,9 @@ def run_scraper(
 
     report(progress_callback, f"Writing output file: {output_path}")
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        pd.DataFrame(candidate_rows, columns=CANDIDATE_COLUMNS).to_excel(writer, sheet_name="Candidate Pages", index=False)
-        pd.DataFrame(programme_rows, columns=OUTPUT_PROGRAMME_COLUMNS).to_excel(writer, sheet_name="Extracted Programmes", index=False)
-        pd.DataFrame(log_rows, columns=RUN_LOG_COLUMNS).to_excel(writer, sheet_name="Run Log", index=False)
+        pd.DataFrame(candidate_rows, columns=CANDIDATE_COLUMNS).to_excel(writer, sheet_name=SHEET_CANDIDATE_PAGES, index=False)
+        pd.DataFrame(programme_rows, columns=OUTPUT_PROGRAMME_COLUMNS).to_excel(writer, sheet_name=SHEET_EXTRACTED_PROGRAMMES, index=False)
+        pd.DataFrame(log_rows, columns=RUN_LOG_COLUMNS).to_excel(writer, sheet_name=SHEET_RUN_LOG, index=False)
     report(progress_callback, f"Done. Created {output_path}")
     return output_path
 

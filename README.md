@@ -6,6 +6,8 @@ It focuses on public pages about short-term programmes in Japan for internationa
 
 Both options are supported: daily Windows use through the desktop app, and command-line/script use for technical users.
 
+This branch intentionally keeps the original MVP crawler and the new Windows app together in one simple tool.
+
 ## Quick start for Windows users
 
 ### 1. Download the Windows app
