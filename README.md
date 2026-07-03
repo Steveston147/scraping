@@ -4,6 +4,8 @@ This MVP helps find inbound short-term programme pages on university websites an
 
 It focuses on public pages about short-term programmes in Japan for international students or overseas partner universities. It does **not** extract PDF text yet. If it finds PDF links, it records the PDF URL and marks it as `PDF review needed`.
 
+Both options are supported: daily Windows use through the desktop app, and command-line/script use for technical users.
+
 ## Quick start for Windows users
 
 ### 1. Download the Windows app
