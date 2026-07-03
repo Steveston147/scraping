@@ -1,0 +1,6 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+input_urls.xlsx
+output_programmes.xlsx
