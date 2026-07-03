@@ -5,6 +5,7 @@ OpenAI-extracted programme rows, and a run log.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -12,7 +13,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urldefrag, urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
@@ -120,10 +121,20 @@ def get_robot_parser(start_url: str) -> RobotFileParser:
     rp = RobotFileParser()
     rp.set_url(robots_url)
     try:
-        rp.read()
-    except Exception:
-        # If robots.txt cannot be read, continue politely with tight limits.
+        response = requests.get(robots_url, headers={"User-Agent": USER_AGENT}, timeout=10)
+        if response.status_code < 500:
+            response.raise_for_status()
+            rp.parse(response.text.splitlines())
+            return rp
+    except requests.RequestException:
         pass
+
+    # Safe robots.txt fallback: network errors, timeouts, URL errors, and 5xx
+    # server responses mean we could not learn the site's rules, not that every
+    # page is disallowed. Continue only under the crawler's strict safeguards:
+    # same/related domains, depth and page limits, polite delay, and avoidance
+    # of login, form, contact, and personal-data collection areas.
+    rp.parse(["User-agent: *", "Allow: /"])
     return rp
 
 
@@ -264,22 +275,34 @@ Page text:
         return [], str(exc)
 
 
-def main() -> None:
-    load_dotenv()
-    input_path = os.getenv("INPUT_FILE", INPUT_FILE)
-    output_path = os.getenv("OUTPUT_FILE", OUTPUT_FILE)
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    api_key = os.getenv("OPENAI_API_KEY")
-    client = OpenAI(api_key=api_key) if api_key else None
+def run_scraper(
+    input_path: str = INPUT_FILE,
+    output_path: str = OUTPUT_FILE,
+    api_key: Optional[str] = None,
+    model: str = "gpt-4o-mini",
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> str:
+    """Run the crawler/extractor and write the Excel workbook.
 
+    This function is used by both the command-line entry point and the
+    Windows-friendly Tkinter GUI.
+    """
+    def report(message: str) -> None:
+        print(message)
+        if progress_callback:
+            progress_callback(message)
+
+    client = OpenAI(api_key=api_key) if api_key else None
     inputs = read_input_file(input_path)
     candidate_rows: List[Dict[str, object]] = []
     programme_rows: List[Dict[str, str]] = []
     log_rows: List[Dict[str, object]] = []
 
+    report(f"Loaded {len(inputs)} university row(s) from {input_path}")
     for _, source in inputs.iterrows():
         university = str(source.get("University", "")).strip()
         start_url = str(source.get("Start URL", "")).strip()
+        report(f"Starting {university or '(missing university name)'}")
         status = "Completed"
         error_parts: List[str] = []
         candidates: List[PageResult] = []
@@ -303,6 +326,7 @@ def main() -> None:
                 for page in extraction_pages:
                     if page.score < 20:
                         continue
+                    report(f"Extracting programme data from {page.url}")
                     rows, extract_error = extract_programmes_with_openai(client, model, university, page)
                     programme_rows.extend(rows)
                     if extract_error:
@@ -320,12 +344,29 @@ def main() -> None:
             "Error Message": " | ".join(error_parts),
             "Run DateTime": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         })
+        report(f"Finished {university}: {status}; {len(candidates)} candidate page(s)")
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         pd.DataFrame(candidate_rows, columns=CANDIDATE_COLUMNS).to_excel(writer, sheet_name="Candidate Pages", index=False)
         pd.DataFrame(programme_rows, columns=OUTPUT_PROGRAMME_COLUMNS).to_excel(writer, sheet_name="Extracted Programmes", index=False)
         pd.DataFrame(log_rows, columns=RUN_LOG_COLUMNS).to_excel(writer, sheet_name="Run Log", index=False)
-    print(f"Wrote {output_path}")
+    report(f"Wrote {output_path}")
+    return output_path
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Crawl university sites and extract inbound short-term programme information.")
+    parser.add_argument("--input", default=os.getenv("INPUT_FILE", INPUT_FILE), help="Path to input_urls.xlsx")
+    parser.add_argument("--output", default=os.getenv("OUTPUT_FILE", OUTPUT_FILE), help="Path for output_programmes.xlsx")
+    parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), help="OpenAI model name")
+    parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY"), help="OpenAI API key. Defaults to OPENAI_API_KEY.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    load_dotenv()
+    args = parse_args()
+    run_scraper(input_path=args.input, output_path=args.output, api_key=args.api_key, model=args.model)
 
 
 if __name__ == "__main__":
