@@ -80,6 +80,15 @@ class PageResult:
     text: str
 
 
+@dataclass
+class RobotsPolicy:
+    """robots.txt rules plus whether they were actually available."""
+
+    parser: RobotFileParser
+    available: bool
+    reason: str = ""
+
+
 def report(progress_callback: ProgressCallback, message: str) -> None:
     """Send a progress message to the GUI or print nothing in CLI mode."""
     if progress_callback:
@@ -126,21 +135,33 @@ def should_skip_url(url: str) -> bool:
     return any(part in lower for part in AVOID_URL_PARTS) or lower.startswith("mailto:") or lower.startswith("tel:")
 
 
-def get_robot_parser(start_url: str) -> RobotFileParser:
+def get_robot_policy(start_url: str) -> RobotsPolicy:
+    """Read robots.txt when possible, with a safe polite fallback.
+
+    If robots.txt is readable, the crawler respects it. If robots.txt cannot be
+    read because of a network error, timeout, URL error, or server-side 5xx
+    response, this MVP does not treat that as "block every page". Instead, it
+    continues politely using the strict existing safeguards: same/related-domain
+    only, depth and page limits, request delay, and login/form avoidance.
+    """
     parsed = urlparse(start_url)
     robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
     rp = RobotFileParser()
     rp.set_url(robots_url)
     try:
-        rp.read()
-    except Exception:
-        # If robots.txt cannot be read, continue politely with tight limits.
-        pass
-    return rp
+        response = requests.get(robots_url, headers={"User-Agent": USER_AGENT}, timeout=10)
+        if 200 <= response.status_code < 300:
+            rp.parse(response.text.splitlines())
+            return RobotsPolicy(rp, True)
+        if 400 <= response.status_code < 500:
+            return RobotsPolicy(rp, False, f"robots.txt not present or unavailable ({response.status_code})")
+        return RobotsPolicy(rp, False, f"robots.txt server error ({response.status_code})")
+    except requests.RequestException as exc:
+        return RobotsPolicy(rp, False, f"robots.txt could not be read: {exc}")
 
 
-def fetch_html(url: str, robot_parser: RobotFileParser) -> Optional[str]:
-    if not robot_parser.can_fetch(USER_AGENT, url):
+def fetch_html(url: str, robots_policy: RobotsPolicy) -> Optional[str]:
+    if robots_policy.available and not robots_policy.parser.can_fetch(USER_AGENT, url):
         return None
     headers = {"User-Agent": USER_AGENT}
     response = requests.get(url, headers=headers, timeout=20)
@@ -190,7 +211,9 @@ def score_page(title: str, text: str, url: str) -> Tuple[int, List[str], str, st
 def crawl_university(university: str, start_url: str, progress_callback: ProgressCallback = None) -> Tuple[List[PageResult], int, Optional[str]]:
     start_url = normalise_url(start_url)
     start_host = urlparse(start_url).hostname or ""
-    robot_parser = get_robot_parser(start_url)
+    robots_policy = get_robot_policy(start_url)
+    if not robots_policy.available and robots_policy.reason:
+        report(progress_callback, f"{university}: {robots_policy.reason}; continuing politely with strict crawl limits")
     queue = deque([(start_url, 0)])
     visited: Set[str] = set()
     candidates: List[PageResult] = []
@@ -203,7 +226,7 @@ def crawl_university(university: str, start_url: str, progress_callback: Progres
         visited.add(url)
         report(progress_callback, f"{university}: visiting page {len(visited)}/{MAX_PAGES_PER_UNIVERSITY}: {url}")
         try:
-            html = fetch_html(url, robot_parser)
+            html = fetch_html(url, robots_policy)
             time.sleep(REQUEST_DELAY_SECONDS)
             if html is None:
                 continue

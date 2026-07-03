@@ -2,8 +2,9 @@ name: Build Windows executable
 
 on:
   workflow_dispatch:
+  pull_request:
   push:
-    branches: [ main, master, work ]
+    branches: [ main, master ]
 
 jobs:
   build-windows:

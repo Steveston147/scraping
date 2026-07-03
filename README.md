@@ -94,7 +94,7 @@ Do not commit real API keys to version control.
 
 ## Build the Windows executable manually
 
-GitHub Actions builds the Windows `.exe` automatically. To build it manually on Windows:
+GitHub Actions builds the Windows `.exe` automatically for pull requests and pushes to the main branch. To build it manually on Windows:
 
 ```powershell
 python -m venv .venv
