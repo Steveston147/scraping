@@ -58,20 +58,28 @@ IMPORTANT_FIELDS = [
     "Main Contents", "Eligibility",
 ]
 OUTPUT_PROGRAMME_COLUMNS = [
+    # New review-focused columns.
     "University", "Programme Name", "Programme Type", "Institution / Department",
     "Target Students", "Language", "Duration / Period", "Programme Dates",
     "Application Deadline", "Programme Fee", "Housing", "Credits / Certificate",
     "Main Contents", "Eligibility", "Source URL", "Source Page Title",
     "Confidence Score", "Missing Fields", "Review Status", "Notes",
+    # Legacy MVP columns retained for compatibility with the current main branch output.
+    "Country or Region", "Target Participants", "Period", "Duration", "Capacity",
+    "Academic Year", "Summary", "Evidence Text", "Check Status", "Notes for Human Review",
 ]
 INPUT_COLUMNS = ["University", "Start URL", "Notes"]
 CANDIDATE_COLUMNS = [
     "University", "URL", "Page Title", "Candidate Score", "Matched Keywords",
     "Candidate Type", "Reason", "Needs Review", "PDF Links", "Notes",
+    # Legacy MVP aliases retained for compatibility.
+    "Relevance Score", "Found Keywords",
 ]
 RUN_LOG_COLUMNS = [
     "University", "Start URL", "Status", "Start Time", "End Time", "Pages Visited",
     "Candidate Pages Found", "Programmes Extracted", "Warnings", "Error Details",
+    # Legacy MVP aliases retained for compatibility.
+    "Error Message", "Run DateTime",
 ]
 
 
@@ -416,6 +424,13 @@ def extract_programme_info_from_page(university: str, page: PageResult, item: Op
     row["Notes"] = "; ".join(dict.fromkeys(notes))
     row["Missing Fields"] = calculate_missing_fields(row)
     row["Review Status"] = review_status(page.score, row["Missing Fields"])
+    row["Check Status"] = row["Review Status"]
+    row["Target Participants"] = row["Target Students"]
+    row["Period"] = row["Duration / Period"]
+    row["Duration"] = row["Duration / Period"]
+    row["Summary"] = row["Main Contents"]
+    row["Evidence Text"] = page.text[:500]
+    row["Notes for Human Review"] = row["Notes"]
     return row
 
 
@@ -534,6 +549,8 @@ def run_scraper(
                     "Needs Review": page.needs_review,
                     "PDF Links": page.pdf_links,
                     "Notes": page.notes,
+                    "Relevance Score": page.score,
+                    "Found Keywords": page.found_keywords,
                 })
             extraction_pages = [p for p in candidates if p.candidate_type == "HTML" and p.score >= RELEVANCE_THRESHOLD]
             if not extraction_pages:
@@ -573,6 +590,8 @@ def run_scraper(
             "Programmes Extracted": extracted_for_university,
             "Warnings": " | ".join(warnings),
             "Error Details": " | ".join(error_parts),
+            "Error Message": " | ".join(error_parts),
+            "Run DateTime": end_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
         })
         report(f"Finished {university}: {status}; {len(candidates)} candidate page(s); {extracted_for_university} programme row(s)")
 
