@@ -14,12 +14,15 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from typing import Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urldefrag, urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
 import pandas as pd
 import requests
+from openpyxl.styles import PatternFill
+from openpyxl.utils import get_column_letter
 from bs4 import BeautifulSoup
 
 INPUT_FILE = "target_universities.csv"
@@ -40,12 +43,15 @@ PROGRAMME_COLUMNS = [
     "Target Students", "Language", "Duration / Period", "Programme Dates",
     "Application Deadline", "Programme Fee", "Housing", "Credits / Certificate",
     "Main Contents", "Eligibility", "Source URL", "Source Page Title",
-    "Confidence Score", "Missing Fields", "Review Status", "Notes",
+    "Confidence Score", "Missing Fields", "Review Status", "Duplicate Group",
+    "Duplicate Status", "Last Checked", "Extraction Method", "Notes",
 ]
 RUN_LOG_COLUMNS = [
-    "Start Time", "End Time", "Universities Processed", "Pages Visited",
-    "Candidate Pages Found", "Candidate Pages Read", "Programme Rows Written",
-    "Fallback Rows Written", "Status", "Warnings", "Error Details, if any",
+    "Start Time", "End Time", "Universities Processed",
+    "Universities With Candidates", "Universities With Extracted Programmes",
+    "Total Pages Visited", "Total Candidate Pages", "Candidate Pages Read",
+    "Total Programme Rows", "Fallback Rows", "Duplicate Rows", "Status",
+    "Warnings", "Errors",
 ]
 
 HIGH_PRIORITY_KEYWORDS = [
@@ -69,6 +75,22 @@ NEGATIVE_URL_EXTENSIONS = (
     ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".zip", ".doc", ".docx",
     ".ppt", ".pptx", ".xls", ".xlsx", ".css", ".js", ".mp4", ".mp3",
 )
+
+IMPORTANT_REVIEW_FIELDS = [
+    "Programme Name", "Programme Dates", "Application Deadline", "Programme Fee",
+    "Housing", "Eligibility", "Source URL",
+]
+
+
+def is_missing_value(value: object) -> bool:
+    return not str(value or "").strip() or str(value).strip().lower() in {"unknown", "n/a", "none"}
+
+
+def normalise_duplicate_text(value: str) -> str:
+    value = re.sub(r"https?://", "", value.lower())
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    words = [word for word in value.split() if word not in {"program", "programme", "the", "and", "of"}]
+    return " ".join(words).strip()
 
 
 @dataclass
@@ -114,6 +136,10 @@ class ProgrammeRow:
     confidence_score: int
     missing_fields: str
     review_status: str
+    duplicate_group: str
+    duplicate_status: str
+    last_checked: str
+    extraction_method: str
     notes: str
 
 
@@ -324,22 +350,35 @@ def extract_programme_from_candidate(target: UniversityTarget, page: CandidatePa
         "Main Contents": first_match(text, [r"(?:Overview|About|Contents?|Description)[:\s]+([^\n]{20,500})"]),
         "Eligibility": first_match(text, [r"Eligibility[:\s]+([^\n]{3,500})", r"Requirements?[:\s]+([^\n]{3,500})"]),
     }
-    missing = [key for key, value in fields.items() if not value or value == "Unknown"]
-    confidence = min(100, page.score + (15 if not inferred else 0) + 5 * (len(fields) - len(missing)))
-    if missing:
-        review_status = "Needs human review"
-    elif confidence < 35:
+    review_values = {
+        "Programme Name": name,
+        "Programme Dates": fields["Programme Dates"],
+        "Application Deadline": fields["Application Deadline"],
+        "Programme Fee": fields["Programme Fee"],
+        "Housing": fields["Housing"],
+        "Eligibility": fields["Eligibility"],
+        "Source URL": page.url,
+    }
+    missing = [key for key in IMPORTANT_REVIEW_FIELDS if is_missing_value(review_values.get(key))]
+    present_important = len(IMPORTANT_REVIEW_FIELDS) - len(missing)
+    programme_keywords = sum(1 for kw in HIGH_PRIORITY_KEYWORDS if kw in text.lower())
+    confidence = min(100, max(0, page.score + (12 if not inferred else -8) + 8 * present_important + min(10, programme_keywords * 2)))
+    if page.score < MIN_CANDIDATE_SCORE or (present_important <= 2 and programme_keywords <= 1):
         review_status = "Low confidence"
-    else:
+    elif page.url and inferred and missing:
+        review_status = "Needs human review"
+    elif name and page.url and present_important >= 5:
         review_status = "Likely valid"
-    notes = "Inferred from page title, heading, or URL." if inferred else ""
-    return ProgrammeRow(target.name, target.country, name, fields["Programme Type"], fields["Target Students"], fields["Language"], fields["Duration / Period"], fields["Programme Dates"], fields["Application Deadline"], fields["Programme Fee"], fields["Housing"], fields["Credits / Certificate"], fields["Main Contents"], fields["Eligibility"], page.url, title or page.title, confidence, ", ".join(missing), review_status, notes)
+    else:
+        review_status = "Needs human review"
+    notes = "Programme name inferred from page title, heading, or URL." if inferred else ""
+    return ProgrammeRow(target.name, target.country, name, fields["Programme Type"], fields["Target Students"], fields["Language"], fields["Duration / Period"], fields["Programme Dates"], fields["Application Deadline"], fields["Programme Fee"], fields["Housing"], fields["Credits / Certificate"], fields["Main Contents"], fields["Eligibility"], page.url, title or page.title, confidence, ", ".join(missing), review_status, "", "Unique", datetime.now(timezone.utc).strftime("%Y-%m-%d"), "heuristic", notes)
 
 
 def make_fallback_programme_row(target: UniversityTarget, page: CandidatePage) -> ProgrammeRow:
     name, _ = infer_programme_name(page.title, "", page.url)
-    missing = [column for column in PROGRAMME_COLUMNS if column not in {"University Name", "Country", "Programme Name", "Source URL", "Source Page Title", "Confidence Score", "Missing Fields", "Review Status", "Notes"}]
-    return ProgrammeRow(target.name, target.country, name, "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", page.url, page.title, min(page.score, 50), ", ".join(missing), "Needs human review", "Fallback candidate row because no programme rows were extracted for this university. Inferred from page title, heading, or URL.")
+    missing = ["Programme Dates", "Application Deadline", "Programme Fee", "Housing", "Eligibility"]
+    return ProgrammeRow(target.name, target.country, name, "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", page.url, page.title, min(page.score, 45), ", ".join(missing), "Needs human review", "", "Unique", datetime.now(timezone.utc).strftime("%Y-%m-%d"), "fallback", "Fallback candidate row because no programme rows were extracted for this university. Programme name inferred from page title or URL.")
 
 
 def programme_to_dict(row: ProgrammeRow) -> Dict[str, object]:
@@ -350,8 +389,74 @@ def programme_to_dict(row: ProgrammeRow) -> Dict[str, object]:
         "Application Deadline": row.application_deadline, "Programme Fee": row.programme_fee, "Housing": row.housing,
         "Credits / Certificate": row.credits_certificate, "Main Contents": row.main_contents, "Eligibility": row.eligibility,
         "Source URL": row.source_url, "Source Page Title": row.source_page_title, "Confidence Score": row.confidence_score,
-        "Missing Fields": row.missing_fields, "Review Status": row.review_status, "Notes": row.notes,
+        "Missing Fields": row.missing_fields, "Review Status": row.review_status, "Duplicate Group": row.duplicate_group,
+        "Duplicate Status": row.duplicate_status, "Last Checked": row.last_checked, "Extraction Method": row.extraction_method,
+        "Notes": row.notes,
     }
+
+
+def mark_duplicate_programmes(rows: List[Dict[str, object]]) -> int:
+    """Mark exact and near duplicate programme rows in-place."""
+    groups: List[List[int]] = []
+    signatures: List[Tuple[str, str]] = []
+    for index, row in enumerate(rows):
+        name_key = normalise_duplicate_text(str(row.get("Programme Name", "")))
+        url_key = normalise_url(str(row.get("Source URL", ""))) if row.get("Source URL") else ""
+        matched_group: Optional[int] = None
+        for group_index, (existing_name, existing_url) in enumerate(signatures):
+            same_url = bool(url_key and existing_url and url_key == existing_url)
+            similar_name = SequenceMatcher(None, name_key, existing_name).ratio() >= 0.88 if name_key and existing_name else False
+            same_parent_page = bool(url_key and existing_url and urlparse(url_key).netloc == urlparse(existing_url).netloc and urlparse(url_key).path.rstrip("/") == urlparse(existing_url).path.rstrip("/"))
+            if similar_name and (same_url or same_parent_page):
+                matched_group = group_index
+                break
+        if matched_group is None:
+            signatures.append((name_key, url_key))
+            groups.append([index])
+        else:
+            groups[matched_group].append(index)
+
+    duplicate_count = 0
+    for group_number, indexes in enumerate(groups, start=1):
+        if len(indexes) == 1:
+            rows[indexes[0]]["Duplicate Group"] = ""
+            rows[indexes[0]]["Duplicate Status"] = "Unique"
+            continue
+        group_label = f"DUP-{group_number:03d}"
+        for position, row_index in enumerate(indexes):
+            rows[row_index]["Duplicate Group"] = group_label
+            rows[row_index]["Duplicate Status"] = "Primary" if position == 0 else "Duplicate"
+            if position > 0:
+                duplicate_count += 1
+                rows[row_index]["Review Status"] = "Needs human review"
+    return duplicate_count
+
+
+def format_workbook(writer: pd.ExcelWriter, sheet_columns: Dict[str, List[str]]) -> None:
+    """Apply lightweight review-friendly formatting to workbook sheets."""
+    fills = {
+        "Likely valid": PatternFill("solid", fgColor="E2F0D9"),
+        "Needs human review": PatternFill("solid", fgColor="FFF2CC"),
+        "Low confidence": PatternFill("solid", fgColor="FCE4D6"),
+        "Duplicate": PatternFill("solid", fgColor="D9EAF7"),
+    }
+    for sheet_name, columns in sheet_columns.items():
+        worksheet = writer.sheets[sheet_name]
+        worksheet.freeze_panes = "A2"
+        worksheet.auto_filter.ref = worksheet.dimensions
+        for idx, column in enumerate(columns, start=1):
+            worksheet.column_dimensions[get_column_letter(idx)].width = min(60, max(12, len(column) + 2))
+        if sheet_name == "Extracted Programmes":
+            status_index = columns.index("Review Status") if "Review Status" in columns else -1
+            duplicate_index = columns.index("Duplicate Status") if "Duplicate Status" in columns else -1
+            for row in worksheet.iter_rows(min_row=2):
+                status = row[status_index].value if status_index >= 0 else ""
+                duplicate = row[duplicate_index].value if duplicate_index >= 0 else ""
+                fill = fills.get("Duplicate" if duplicate == "Duplicate" else status)
+                if fill:
+                    for cell in row:
+                        cell.fill = fill
+
 
 
 def read_targets(input_path: str) -> List[UniversityTarget]:
@@ -399,6 +504,9 @@ def run_scraper(
     universities_processed = 0
     candidate_pages_read = 0
     fallback_rows_written = 0
+    universities_with_candidates = 0
+    universities_with_extracted_programmes = 0
+    duplicate_rows = 0
 
     try:
         targets = read_targets(input_path)
@@ -408,6 +516,8 @@ def run_scraper(
             universities_processed += 1
             candidates, visited_count, university_warnings = crawl_university(target)
             pages_visited += visited_count
+            if candidates:
+                universities_with_candidates += 1
             warnings.extend([f"{target.name}: {warning}" for warning in university_warnings])
             university_programme_rows: List[Dict[str, object]] = []
             robot_parser = get_robot_parser(normalise_url(target.seed_url))
@@ -437,6 +547,8 @@ def run_scraper(
                 fallback_pages = candidates[:min(5, len(candidates))]
                 university_programme_rows.extend(programme_to_dict(make_fallback_programme_row(target, page)) for page in fallback_pages)
                 fallback_rows_written += len(fallback_pages)
+            if university_programme_rows:
+                universities_with_extracted_programmes += 1
             programme_rows.extend(university_programme_rows)
             report(f"Finished {target.name}: visited {visited_count}, found {len(candidates)} candidate page(s), wrote {len(university_programme_rows)} programme row(s)")
         if warnings:
@@ -446,24 +558,33 @@ def run_scraper(
         error_details = str(exc)
 
     end_time = datetime.now(timezone.utc)
+    duplicate_rows = mark_duplicate_programmes(programme_rows)
     run_log_row = {
         "Start Time": start_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
         "End Time": end_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
         "Universities Processed": universities_processed,
-        "Pages Visited": pages_visited,
-        "Candidate Pages Found": len(candidate_rows),
+        "Universities With Candidates": universities_with_candidates,
+        "Universities With Extracted Programmes": universities_with_extracted_programmes,
+        "Total Pages Visited": pages_visited,
+        "Total Candidate Pages": len(candidate_rows),
         "Candidate Pages Read": candidate_pages_read,
-        "Programme Rows Written": len(programme_rows),
-        "Fallback Rows Written": fallback_rows_written,
+        "Total Programme Rows": len(programme_rows),
+        "Fallback Rows": fallback_rows_written,
+        "Duplicate Rows": duplicate_rows,
         "Status": status,
         "Warnings": " | ".join(warnings[:20]),
-        "Error Details, if any": error_details,
+        "Errors": error_details,
     }
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         pd.DataFrame(candidate_rows, columns=CANDIDATE_COLUMNS).to_excel(writer, sheet_name="Candidate Pages", index=False)
         pd.DataFrame(programme_rows, columns=PROGRAMME_COLUMNS).to_excel(writer, sheet_name="Extracted Programmes", index=False)
         pd.DataFrame([run_log_row], columns=RUN_LOG_COLUMNS).to_excel(writer, sheet_name="Run Log", index=False)
+        format_workbook(writer, {
+            "Candidate Pages": CANDIDATE_COLUMNS,
+            "Extracted Programmes": PROGRAMME_COLUMNS,
+            "Run Log": RUN_LOG_COLUMNS,
+        })
     report(f"Wrote {output_path}")
     return output_path
 

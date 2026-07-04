@@ -92,10 +92,6 @@ class ScraperApp(tk.Tk):
         if not output_folder:
             messagebox.showerror("Missing output folder", "Please choose an output folder.")
             return
-        if not api_key:
-            messagebox.showerror("Missing API key", "Please enter your OpenAI API key.")
-            return
-
         output_path = str(Path(output_folder) / OUTPUT_FILE)
         self.run_button.configure(state="disabled")
         self._append_log("Starting scraper...")
