@@ -1,6 +1,6 @@
 # Generic Programme Candidate Page Scraper
 
-Phase 1 collects candidate pages for short-term, inbound, summer, exchange, Japanese language, and customized/customised programmes from multiple university websites. It writes results for human review to `output_programmes.xlsx`.
+The scraper collects candidate pages for short-term, inbound, summer, exchange, Japanese language, and customized/customised programmes from multiple university websites, then performs generic heuristic programme extraction for human review. It writes results to `output_programmes.xlsx`.
 
 ## Prepare `target_universities.csv`
 
@@ -26,6 +26,7 @@ python programme_scraper.py --input target_universities.csv --output output_prog
 `output_programmes.xlsx` contains:
 
 1. **Candidate Pages** - candidate URL, page title, score, matched keywords, candidate type, reason, and review flag.
-2. **Run Log** - start/end time, universities processed, pages visited, candidate count, status, warnings, and error details.
+2. **Extracted Programmes** - one row per extracted or fallback programme candidate, including source URL, review status, confidence score, missing fields, and notes. Missing values are left blank or marked `Unknown`; fees, dates, deadlines, eligibility, and housing are not invented.
+3. **Run Log** - start/end time, universities processed, pages visited, candidate count, candidate pages read, programme rows written, fallback rows written, status, warnings, and error details.
 
-This phase is keyword-based candidate collection only. It does not perform final programme extraction, add a GUI, build Windows packages, configure GitHub Actions, or require the OpenAI API.
+If a university has candidate pages but no programme rows can be extracted, the scraper writes the top 3 to 5 candidate pages into **Extracted Programmes** as fallback rows marked `Needs human review`. The scraper remains generic and does not require the OpenAI API.

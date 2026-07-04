@@ -1,8 +1,8 @@
-"""Generic Phase 1 crawler for university programme candidate pages.
+"""Generic multi-university crawler and programme extractor.
 
 Reads target_universities.csv and writes output_programmes.xlsx with candidate
-pages and a run log. This phase intentionally does not perform final programme
-extraction; it collects useful pages for human review.
+pages, extracted programme review rows, and a run log. Extraction is heuristic
+and intentionally generic so it can work across different university websites.
 """
 from __future__ import annotations
 
@@ -35,9 +35,17 @@ CANDIDATE_COLUMNS = [
     "University Name", "Country", "URL", "Page Title", "Candidate Score",
     "Matched Keywords", "Candidate Type", "Reason", "Needs Review",
 ]
+PROGRAMME_COLUMNS = [
+    "University Name", "Country", "Programme Name", "Programme Type",
+    "Target Students", "Language", "Duration / Period", "Programme Dates",
+    "Application Deadline", "Programme Fee", "Housing", "Credits / Certificate",
+    "Main Contents", "Eligibility", "Source URL", "Source Page Title",
+    "Confidence Score", "Missing Fields", "Review Status", "Notes",
+]
 RUN_LOG_COLUMNS = [
     "Start Time", "End Time", "Universities Processed", "Pages Visited",
-    "Candidate Pages Found", "Status", "Warnings", "Error Details, if any",
+    "Candidate Pages Found", "Candidate Pages Read", "Programme Rows Written",
+    "Fallback Rows Written", "Status", "Warnings", "Error Details, if any",
 ]
 
 HIGH_PRIORITY_KEYWORDS = [
@@ -83,6 +91,30 @@ class CandidatePage:
     candidate_type: str
     reason: str
     needs_review: str = "Yes"
+
+
+@dataclass
+class ProgrammeRow:
+    university_name: str
+    country: str
+    programme_name: str
+    programme_type: str
+    target_students: str
+    language: str
+    duration_period: str
+    programme_dates: str
+    application_deadline: str
+    programme_fee: str
+    housing: str
+    credits_certificate: str
+    main_contents: str
+    eligibility: str
+    source_url: str
+    source_page_title: str
+    confidence_score: int
+    missing_fields: str
+    review_status: str
+    notes: str
 
 
 def normalise_url(url: str) -> str:
@@ -224,6 +256,104 @@ def crawl_university(target: UniversityTarget) -> Tuple[List[CandidatePage], int
     return candidates, len(visited), warnings
 
 
+
+def extract_heading(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag_name in ["h1", "h2"]:
+        tag = soup.find(tag_name)
+        if tag:
+            heading = re.sub(r"\s+", " ", tag.get_text(" ", strip=True))
+            if heading:
+                return heading
+    return ""
+
+
+def infer_programme_name(title: str, heading: str, url: str) -> Tuple[str, bool]:
+    candidates = [heading, title]
+    for value in candidates:
+        cleaned = re.sub(r"\s*[|–—-]\s*(.+University|Admissions|International.*)$", "", value, flags=re.I).strip()
+        if cleaned and len(cleaned) >= 4:
+            return cleaned[:200], value != heading or not heading
+    path_tail = urlparse(url).path.rstrip("/").split("/")[-1]
+    inferred = re.sub(r"[-_]+", " ", path_tail).strip().title()
+    return (inferred or "Unknown Programme"), True
+
+
+def first_match(text: str, patterns: List[str]) -> str:
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.I)
+        if match:
+            return re.sub(r"\s+", " ", match.group(1)).strip(" :-–—")[:500]
+    return "Unknown"
+
+
+def detect_programme_type(text: str, url: str) -> str:
+    haystack = f"{text} {url}".lower()
+    mapping = [
+        ("Summer Programme", ["summer program", "summer programme", "summer school"]),
+        ("Short-term Programme", ["short-term", "short term"]),
+        ("Exchange Programme", ["exchange program", "exchange programme"]),
+        ("Japanese Language Programme", ["japanese language"]),
+        ("Certificate Programme", ["certificate"]),
+        ("Study Abroad Programme", ["study abroad"]),
+    ]
+    for label, terms in mapping:
+        if any(term in haystack for term in terms):
+            return label
+    return "Unknown"
+
+
+def extract_programme_from_candidate(target: UniversityTarget, page: CandidatePage, html: str) -> Optional[ProgrammeRow]:
+    title, text, _ = extract_page(html, page.url)
+    heading = extract_heading(html)
+    name, inferred = infer_programme_name(title or page.title, heading, page.url)
+    if not name or not page.url:
+        return None
+
+    language = "English" if re.search(r"\bEnglish\b", text, re.I) else ("Japanese" if re.search(r"\bJapanese\b", text, re.I) else "Unknown")
+    fields = {
+        "Programme Type": detect_programme_type(text, page.url),
+        "Target Students": first_match(text, [r"Target(?:ed)? (?:Students|Participants|Audience)[:\s]+([^.;\n]{3,180})", r"Eligibility[:\s]+([^.;\n]{3,180})"]),
+        "Language": language,
+        "Duration / Period": first_match(text, [r"Duration[:\s]+([^.;\n]{3,180})", r"Period[:\s]+([^.;\n]{3,180})"]),
+        "Programme Dates": first_match(text, [r"(?:Program|Programme) Dates?[:\s]+([^.;\n]{3,180})", r"Dates?[:\s]+([^.;\n]{3,180})"]),
+        "Application Deadline": first_match(text, [r"Application Deadline[:\s]+([^.;\n]{3,180})", r"Deadline[:\s]+([^.;\n]{3,180})"]),
+        "Programme Fee": first_match(text, [r"(?:Program|Programme) Fee[:\s]+([^.;\n]{3,180})", r"Tuition[:\s]+([^.;\n]{3,180})", r"Fee[:\s]+([^.;\n]{3,180})"]),
+        "Housing": "Available" if re.search(r"\b(housing|accommodation|dormitory|residence)\b", text, re.I) else "Unknown",
+        "Credits / Certificate": first_match(text, [r"(?:Credits?|Certificate)[:\s]+([^.;\n]{3,180})"]),
+        "Main Contents": first_match(text, [r"(?:Overview|About|Contents?|Description)[:\s]+([^\n]{20,500})"]),
+        "Eligibility": first_match(text, [r"Eligibility[:\s]+([^\n]{3,500})", r"Requirements?[:\s]+([^\n]{3,500})"]),
+    }
+    missing = [key for key, value in fields.items() if not value or value == "Unknown"]
+    confidence = min(100, page.score + (15 if not inferred else 0) + 5 * (len(fields) - len(missing)))
+    if missing:
+        review_status = "Needs human review"
+    elif confidence < 35:
+        review_status = "Low confidence"
+    else:
+        review_status = "Likely valid"
+    notes = "Inferred from page title, heading, or URL." if inferred else ""
+    return ProgrammeRow(target.name, target.country, name, fields["Programme Type"], fields["Target Students"], fields["Language"], fields["Duration / Period"], fields["Programme Dates"], fields["Application Deadline"], fields["Programme Fee"], fields["Housing"], fields["Credits / Certificate"], fields["Main Contents"], fields["Eligibility"], page.url, title or page.title, confidence, ", ".join(missing), review_status, notes)
+
+
+def make_fallback_programme_row(target: UniversityTarget, page: CandidatePage) -> ProgrammeRow:
+    name, _ = infer_programme_name(page.title, "", page.url)
+    missing = [column for column in PROGRAMME_COLUMNS if column not in {"University Name", "Country", "Programme Name", "Source URL", "Source Page Title", "Confidence Score", "Missing Fields", "Review Status", "Notes"}]
+    return ProgrammeRow(target.name, target.country, name, "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", page.url, page.title, min(page.score, 50), ", ".join(missing), "Needs human review", "Fallback candidate row because no programme rows were extracted for this university. Inferred from page title, heading, or URL.")
+
+
+def programme_to_dict(row: ProgrammeRow) -> Dict[str, object]:
+    return {
+        "University Name": row.university_name, "Country": row.country, "Programme Name": row.programme_name,
+        "Programme Type": row.programme_type, "Target Students": row.target_students, "Language": row.language,
+        "Duration / Period": row.duration_period, "Programme Dates": row.programme_dates,
+        "Application Deadline": row.application_deadline, "Programme Fee": row.programme_fee, "Housing": row.housing,
+        "Credits / Certificate": row.credits_certificate, "Main Contents": row.main_contents, "Eligibility": row.eligibility,
+        "Source URL": row.source_url, "Source Page Title": row.source_page_title, "Confidence Score": row.confidence_score,
+        "Missing Fields": row.missing_fields, "Review Status": row.review_status, "Notes": row.notes,
+    }
+
+
 def read_targets(input_path: str) -> List[UniversityTarget]:
     with open(input_path, newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
@@ -261,11 +391,14 @@ def run_scraper(
 
     start_time = datetime.now(timezone.utc)
     candidate_rows: List[Dict[str, object]] = []
+    programme_rows: List[Dict[str, object]] = []
     warnings: List[str] = []
     error_details = ""
     status = "Completed"
     pages_visited = 0
     universities_processed = 0
+    candidate_pages_read = 0
+    fallback_rows_written = 0
 
     try:
         targets = read_targets(input_path)
@@ -276,6 +409,8 @@ def run_scraper(
             candidates, visited_count, university_warnings = crawl_university(target)
             pages_visited += visited_count
             warnings.extend([f"{target.name}: {warning}" for warning in university_warnings])
+            university_programme_rows: List[Dict[str, object]] = []
+            robot_parser = get_robot_parser(normalise_url(target.seed_url))
             for page in candidates:
                 candidate_rows.append({
                     "University Name": page.university_name,
@@ -288,7 +423,22 @@ def run_scraper(
                     "Reason": page.reason,
                     "Needs Review": page.needs_review,
                 })
-            report(f"Finished {target.name}: visited {visited_count}, found {len(candidates)} candidate page(s)")
+                try:
+                    html = fetch_html(page.url, robot_parser)
+                    time.sleep(REQUEST_DELAY_SECONDS)
+                    candidate_pages_read += 1
+                    if html:
+                        programme = extract_programme_from_candidate(target, page, html)
+                        if programme:
+                            university_programme_rows.append(programme_to_dict(programme))
+                except Exception as exc:
+                    warnings.append(f"{target.name}: extraction failed for {page.url}: {exc}")
+            if candidates and not university_programme_rows:
+                fallback_pages = candidates[:min(5, len(candidates))]
+                university_programme_rows.extend(programme_to_dict(make_fallback_programme_row(target, page)) for page in fallback_pages)
+                fallback_rows_written += len(fallback_pages)
+            programme_rows.extend(university_programme_rows)
+            report(f"Finished {target.name}: visited {visited_count}, found {len(candidates)} candidate page(s), wrote {len(university_programme_rows)} programme row(s)")
         if warnings:
             status = "Completed with warnings"
     except Exception as exc:
@@ -302,6 +452,9 @@ def run_scraper(
         "Universities Processed": universities_processed,
         "Pages Visited": pages_visited,
         "Candidate Pages Found": len(candidate_rows),
+        "Candidate Pages Read": candidate_pages_read,
+        "Programme Rows Written": len(programme_rows),
+        "Fallback Rows Written": fallback_rows_written,
         "Status": status,
         "Warnings": " | ".join(warnings[:20]),
         "Error Details, if any": error_details,
@@ -309,6 +462,7 @@ def run_scraper(
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         pd.DataFrame(candidate_rows, columns=CANDIDATE_COLUMNS).to_excel(writer, sheet_name="Candidate Pages", index=False)
+        pd.DataFrame(programme_rows, columns=PROGRAMME_COLUMNS).to_excel(writer, sheet_name="Extracted Programmes", index=False)
         pd.DataFrame([run_log_row], columns=RUN_LOG_COLUMNS).to_excel(writer, sheet_name="Run Log", index=False)
     report(f"Wrote {output_path}")
     return output_path
