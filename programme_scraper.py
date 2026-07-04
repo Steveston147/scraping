@@ -1,12 +1,13 @@
-"""MVP crawler and extractor for inbound short-term programme pages.
+"""Generic Phase 1 crawler for university programme candidate pages.
 
-Reads input_urls.xlsx and writes output_programmes.xlsx with candidate pages,
-OpenAI-extracted programme rows, and a run log.
+Reads target_universities.csv and writes output_programmes.xlsx with candidate
+pages and a run log. This phase intentionally does not perform final programme
+extraction; it collects useful pages for human review.
 """
 from __future__ import annotations
 
 import argparse
-import json
+import csv
 import os
 import re
 import time
@@ -20,63 +21,71 @@ from urllib.robotparser import RobotFileParser
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-from openai import OpenAI
 
-INPUT_FILE = "input_urls.xlsx"
+INPUT_FILE = "target_universities.csv"
 OUTPUT_FILE = "output_programmes.xlsx"
 CRAWL_DEPTH_LIMIT = 2
 MAX_PAGES_PER_UNIVERSITY = 50
-REQUEST_DELAY_SECONDS = 1.5
-RELEVANCE_THRESHOLD = 60
-USER_AGENT = "ProgrammeFinderMVP/1.0 (+https://example.local; polite educational crawler)"
+REQUEST_DELAY_SECONDS = 1.0
+MIN_CANDIDATE_SCORE = 20
+USER_AGENT = "GenericProgrammeCandidateCrawler/1.0 (+https://example.local; polite educational crawler)"
 
-POSITIVE_KEYWORDS = [
-    "short-term programme", "short-term program", "summer programme", "summer program",
-    "winter programme", "winter program", "Japanese language programme",
-    "Japanese language program", "Japanese studies", "study in Japan", "inbound programme",
-    "inbound program", "international students", "overseas students", "partner universities",
-    "custom programme", "custom program", "留学生", "短期受入", "短期プログラム",
-    "日本語プログラム", "サマープログラム", "ウィンタープログラム", "海外大学向け",
-    "受入プログラム", "協定校向け",
-]
-NEGATIVE_KEYWORDS = [
-    "outbound", "study abroad for Japanese students", "outgoing exchange", "派遣留学",
-    "海外留学", "日本人学生向け", "本学学生向け",
-]
-AVOID_URL_PARTS = ["/login", "signin", "auth", "wp-login", "logout", "contact", "inquiry"]
-OUTPUT_PROGRAMME_COLUMNS = [
-    "University", "Programme Name", "Country or Region", "Programme Type", "Target Participants",
-    "Period", "Duration", "Eligibility", "Programme Fee", "Capacity", "Application Deadline",
-    "Academic Year", "Summary", "Source URL", "Evidence Text", "Check Status",
-    "Notes for Human Review",
-]
-INPUT_COLUMNS = ["University", "Start URL", "Notes"]
+INPUT_COLUMNS = ["University Name", "Country", "Seed URL", "Allowed Domain", "Notes"]
 CANDIDATE_COLUMNS = [
-    "University", "Page Title", "URL", "Relevance Score",
-    "Found Keywords", "Reason", "PDF Links", "Notes",
+    "University Name", "Country", "URL", "Page Title", "Candidate Score",
+    "Matched Keywords", "Candidate Type", "Reason", "Needs Review",
 ]
 RUN_LOG_COLUMNS = [
-    "University", "Start URL", "Status", "Pages Visited",
-    "Candidate Pages Found", "Programmes Extracted", "Error Message",
-    "Run DateTime",
+    "Start Time", "End Time", "Universities Processed", "Pages Visited",
+    "Candidate Pages Found", "Status", "Warnings", "Error Details, if any",
 ]
+
+HIGH_PRIORITY_KEYWORDS = [
+    "short-term program", "short-term programme", "summer program", "summer programme",
+    "inbound program", "inbound programme", "japanese language program",
+    "japanese language programme", "customized program", "customised programme",
+    "study abroad", "exchange program", "non-degree", "certificate",
+    "application deadline", "program fee", "programme fee", "tuition", "housing",
+    "accommodation", "eligibility",
+]
+LOW_PRIORITY_KEYWORDS = ["international students", "admissions", "campus life", "news", "events"]
+URL_HINTS = [
+    "short", "summer", "inbound", "japanese", "language", "custom", "exchange",
+    "non-degree", "certificate", "program", "programme", "study-abroad", "international",
+]
+AVOID_URL_PARTS = [
+    "/login", "signin", "auth", "wp-login", "logout", "contact", "inquiry",
+    "calendar", "tag/", "category/", "author/", "share=", "?replytocom=",
+]
+NEGATIVE_URL_EXTENSIONS = (
+    ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".zip", ".doc", ".docx",
+    ".ppt", ".pptx", ".xls", ".xlsx", ".css", ".js", ".mp4", ".mp3",
+)
 
 
 @dataclass
-class PageResult:
-    title: str
-    url: str
-    score: int
-    found_keywords: str
-    reason: str
-    pdf_links: str
+class UniversityTarget:
+    name: str
+    country: str
+    seed_url: str
+    allowed_domain: str
     notes: str
-    text: str
+
+
+@dataclass
+class CandidatePage:
+    university_name: str
+    country: str
+    url: str
+    title: str
+    score: int
+    matched_keywords: List[str]
+    candidate_type: str
+    reason: str
+    needs_review: str = "Yes"
 
 
 def normalise_url(url: str) -> str:
-    """Resolve fragments and standardise a URL enough to avoid duplicate visits."""
     clean, _ = urldefrag(str(url).strip())
     parsed = urlparse(clean)
     if not parsed.scheme:
@@ -85,55 +94,40 @@ def normalise_url(url: str) -> str:
     return parsed._replace(fragment="").geturl().rstrip("/")
 
 
-def related_domain(hostname: str) -> str:
-    """Return a practical base domain, handling common Japanese university domains."""
-    parts = hostname.lower().split(".")
-    if len(parts) >= 3 and parts[-2] in {"ac", "co", "go", "or", "ne"} and parts[-1] == "jp":
-        return ".".join(parts[-3:])
-    if len(parts) >= 2:
-        return ".".join(parts[-2:])
-    return hostname.lower()
+def normalise_domain(domain_or_url: str) -> str:
+    value = str(domain_or_url).strip().lower()
+    parsed = urlparse(value if "://" in value else f"https://{value}")
+    return (parsed.hostname or value).removeprefix("www.")
 
 
-def is_related_url(url: str, start_host: str) -> bool:
-    """Keep crawling on the same host or clearly related university subdomains."""
+def is_allowed_url(url: str, allowed_domain: str) -> bool:
     parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        return False
-    host = parsed.hostname.lower()
-    base = related_domain(start_host)
-    return host == start_host.lower() or host.endswith("." + base) or host == base
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    domain = normalise_domain(allowed_domain)
+    return parsed.scheme in {"http", "https"} and (host == domain or host.endswith(f".{domain}"))
 
 
 def should_skip_url(url: str) -> bool:
-    """Avoid login/contact-like URLs and non-web links.
-
-    This MVP only reads public HTML pages. It does not submit forms,
-    enter login areas, or intentionally collect personal data.
-    """
     lower = url.lower()
-    return any(part in lower for part in AVOID_URL_PARTS) or lower.startswith("mailto:") or lower.startswith("tel:")
+    return (
+        lower.startswith(("mailto:", "tel:", "javascript:"))
+        or lower.endswith(NEGATIVE_URL_EXTENSIONS)
+        or any(part in lower for part in AVOID_URL_PARTS)
+    )
 
 
-def get_robot_parser(start_url: str) -> RobotFileParser:
-    parsed = urlparse(start_url)
-    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+def get_robot_parser(seed_url: str) -> RobotFileParser:
+    parsed = urlparse(seed_url)
     rp = RobotFileParser()
-    rp.set_url(robots_url)
+    rp.set_url(f"{parsed.scheme}://{parsed.netloc}/robots.txt")
     try:
-        response = requests.get(robots_url, headers={"User-Agent": USER_AGENT}, timeout=10)
+        response = requests.get(rp.url, headers={"User-Agent": USER_AGENT}, timeout=10)
         if response.status_code < 500:
             response.raise_for_status()
             rp.parse(response.text.splitlines())
             return rp
     except requests.RequestException:
         pass
-
-    # Safe robots.txt fallback: network errors, timeouts, URL errors, and 5xx
-    # server responses mean we could not learn the site's rules, not that every
-    # page is disallowed. Continue only under the crawler's strict safeguards:
-    # same/related domains, depth and page limits, polite delay, and avoidance
-    # of login, form, contact, and personal-data collection areas.
     rp.parse(["User-agent: *", "Allow: /"])
     return rp
 
@@ -141,8 +135,7 @@ def get_robot_parser(start_url: str) -> RobotFileParser:
 def fetch_html(url: str, robot_parser: RobotFileParser) -> Optional[str]:
     if not robot_parser.can_fetch(USER_AGENT, url):
         return None
-    headers = {"User-Agent": USER_AGENT}
-    response = requests.get(url, headers=headers, timeout=20)
+    response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=20)
     response.raise_for_status()
     content_type = response.headers.get("Content-Type", "").lower()
     if "text/html" not in content_type and "application/xhtml" not in content_type:
@@ -150,54 +143,56 @@ def fetch_html(url: str, robot_parser: RobotFileParser) -> Optional[str]:
     return response.text
 
 
-def extract_text_and_links(html: str, page_url: str) -> Tuple[str, str, List[str], List[str]]:
+def extract_page(html: str, page_url: str) -> Tuple[str, str, List[str]]:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "svg", "form"]):
         tag.decompose()
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
     text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
-    links: List[str] = []
-    pdfs: List[str] = []
-    for anchor in soup.find_all("a", href=True):
-        href = urljoin(page_url, anchor["href"])
-        href = normalise_url(href)
-        if href.lower().endswith(".pdf"):
-            pdfs.append(href)
-        else:
-            links.append(href)
-    return title, text, sorted(set(links)), sorted(set(pdfs))
+    links = sorted({normalise_url(urljoin(page_url, anchor["href"])) for anchor in soup.find_all("a", href=True)})
+    return title, text, links
 
 
 def score_page(title: str, text: str, url: str) -> Tuple[int, List[str], str, str]:
-    haystack = f"{title} {url} {text[:8000]}".lower()
-    positives = [kw for kw in POSITIVE_KEYWORDS if kw.lower() in haystack]
-    negatives = [kw for kw in NEGATIVE_KEYWORDS if kw.lower() in haystack]
-    score = min(100, len(positives) * 18)
-    if any(term in haystack for term in ["application", "fee", "schedule", "eligibility", "duration"]):
-        score += 10
-    if any(term in haystack for term in ["international", "overseas", "留学生", "受入"]):
-        score += 10
-    score -= len(negatives) * 25
-    score = max(0, min(100, score))
-    reason = "Positive keywords found" if positives else "No strong positive keyword found"
-    if negatives:
-        reason += "; negative outbound keywords also found"
-    notes = "PDF review needed" if url.lower().endswith(".pdf") else ""
-    return score, positives, reason, notes
+    haystack = f"{title} {url} {text[:10000]}".lower()
+    matched_high = [kw for kw in HIGH_PRIORITY_KEYWORDS if kw in haystack]
+    matched_low = [kw for kw in LOW_PRIORITY_KEYWORDS if kw in haystack]
+    url_matches = [hint for hint in URL_HINTS if hint in url.lower()]
+    score = min(100, len(matched_high) * 15 + len(matched_low) * 5 + len(url_matches) * 3)
+    if any(term in haystack for term in ["apply", "application", "deadline", "fee", "tuition", "eligibility"]):
+        score = min(100, score + 10)
+    matched = matched_high + matched_low
+    if matched_high:
+        candidate_type = "Strong programme candidate"
+        reason = "High-priority programme keywords found."
+    elif matched_low or url_matches:
+        candidate_type = "Possible related page"
+        reason = "Lower-priority keywords or URL hints found."
+    else:
+        candidate_type = "Low relevance"
+        reason = "No configured candidate keywords found."
+    return score, matched, candidate_type, reason
 
 
-def crawl_university(university: str, start_url: str) -> Tuple[List[PageResult], int, Optional[str]]:
-    start_url = normalise_url(start_url)
-    start_host = urlparse(start_url).hostname or ""
-    robot_parser = get_robot_parser(start_url)
-    queue = deque([(start_url, 0)])
+def should_enqueue_link(url: str, allowed_domain: str) -> bool:
+    if should_skip_url(url) or not is_allowed_url(url, allowed_domain):
+        return False
+    lower = url.lower()
+    return any(hint in lower for hint in URL_HINTS) or lower.count("/") <= 5
+
+
+def crawl_university(target: UniversityTarget) -> Tuple[List[CandidatePage], int, List[str]]:
+    seed_url = normalise_url(target.seed_url)
+    allowed_domain = target.allowed_domain or normalise_domain(seed_url)
+    robot_parser = get_robot_parser(seed_url)
+    queue = deque([(seed_url, 0)])
     visited: Set[str] = set()
-    candidates: List[PageResult] = []
-    error_message = None
+    candidates_by_url: Dict[str, CandidatePage] = {}
+    warnings: List[str] = []
 
     while queue and len(visited) < MAX_PAGES_PER_UNIVERSITY:
         url, depth = queue.popleft()
-        if url in visited or should_skip_url(url) or not is_related_url(url, start_host):
+        if url in visited or should_skip_url(url) or not is_allowed_url(url, allowed_domain):
             continue
         visited.add(url)
         try:
@@ -205,168 +200,130 @@ def crawl_university(university: str, start_url: str) -> Tuple[List[PageResult],
             time.sleep(REQUEST_DELAY_SECONDS)
             if html is None:
                 continue
-            title, text, links, pdf_links = extract_text_and_links(html, url)
-            score, keywords, reason, notes = score_page(title, text, url)
-            if pdf_links:
-                notes = "; ".join(filter(None, [notes, "PDF review needed"]))
-            if score >= 20 or pdf_links:
-                candidates.append(PageResult(title, url, score, ", ".join(keywords), reason, "; ".join(pdf_links), notes, text[:12000]))
+            title, text, links = extract_page(html, url)
+            score, matched, candidate_type, reason = score_page(title, text, url)
+            if score >= MIN_CANDIDATE_SCORE:
+                candidates_by_url[url] = CandidatePage(
+                    university_name=target.name,
+                    country=target.country,
+                    url=url,
+                    title=title,
+                    score=score,
+                    matched_keywords=matched,
+                    candidate_type=candidate_type,
+                    reason=reason,
+                )
             if depth < CRAWL_DEPTH_LIMIT:
                 for link in links:
-                    if link not in visited and is_related_url(link, start_host) and not should_skip_url(link):
+                    if link not in visited and should_enqueue_link(link, allowed_domain):
                         queue.append((link, depth + 1))
-        except Exception as exc:
-            error_message = str(exc)
-            continue
-    candidates.sort(key=lambda p: p.score, reverse=True)
-    return candidates, len(visited), error_message
+        except Exception as exc:  # keep processing other pages and universities
+            warnings.append(f"{url}: {exc}")
+
+    candidates = sorted(candidates_by_url.values(), key=lambda page: page.score, reverse=True)
+    return candidates, len(visited), warnings
 
 
-def read_input_file(input_path: str) -> pd.DataFrame:
-    """Read input_urls.xlsx and verify the required MVP columns are present."""
-    inputs = pd.read_excel(input_path).fillna("")
-    missing_columns = [column for column in INPUT_COLUMNS if column not in inputs.columns]
-    if missing_columns:
-        missing = ", ".join(missing_columns)
-        required = ", ".join(INPUT_COLUMNS)
-        raise ValueError(f"{input_path} is missing required column(s): {missing}. Required columns: {required}.")
-    return inputs
-
-
-def extract_programmes_with_openai(client: OpenAI, model: str, university: str, page: PageResult) -> Tuple[List[Dict[str, str]], Optional[str]]:
-    prompt = f"""
-Extract inbound short-term programme information for international students or overseas partner universities from this page.
-Return valid JSON only, with this shape: {{"programmes": [{{"Programme Name":"", "Country or Region":"", "Programme Type":"", "Target Participants":"", "Period":"", "Duration":"", "Eligibility":"", "Programme Fee":"", "Capacity":"", "Application Deadline":"", "Academic Year":"", "Summary":"", "Evidence Text":"", "Notes for Human Review":""}}]}}.
-Do not guess. Leave missing fields blank. Ignore outbound programmes for Japanese/domestic students. If details appear old or unclear, mention that in Notes for Human Review.
-University: {university}
-URL: {page.url}
-Page title: {page.title}
-Page text:
-{page.text[:10000]}
-"""
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            response_format={"type": "json_object"},
-        )
-        content = response.choices[0].message.content or "{}"
-        data = json.loads(content)
-        programmes = data.get("programmes", [])
-        if not isinstance(programmes, list):
-            return [], "OpenAI JSON did not contain a programmes list"
-        rows: List[Dict[str, str]] = []
-        for item in programmes:
-            if not isinstance(item, dict):
+def read_targets(input_path: str) -> List[UniversityTarget]:
+    with open(input_path, newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        missing = [column for column in INPUT_COLUMNS if column not in (reader.fieldnames or [])]
+        if missing:
+            raise ValueError(f"{input_path} is missing required column(s): {', '.join(missing)}")
+        targets = []
+        for row in reader:
+            name = str(row.get("University Name", "")).strip()
+            seed_url = str(row.get("Seed URL", "")).strip()
+            if not name and not seed_url:
                 continue
-            row = {column: "" for column in OUTPUT_PROGRAMME_COLUMNS}
-            row["University"] = university
-            row["Source URL"] = page.url
-            row["Check Status"] = "Needs human review"
-            for key in row:
-                if key in item and item[key] is not None:
-                    row[key] = str(item[key])
-            if not row["Programme Name"] and not row["Summary"]:
-                continue
-            rows.append(row)
-        return rows, None
-    except Exception as exc:
-        return [], str(exc)
+            if not name or not seed_url:
+                raise ValueError("Each target row must include University Name and Seed URL.")
+            targets.append(UniversityTarget(
+                name=name,
+                country=str(row.get("Country", "")).strip(),
+                seed_url=seed_url,
+                allowed_domain=str(row.get("Allowed Domain", "")).strip() or normalise_domain(seed_url),
+                notes=str(row.get("Notes", "")).strip(),
+            ))
+    return targets
 
 
 def run_scraper(
     input_path: str = INPUT_FILE,
     output_path: str = OUTPUT_FILE,
-    api_key: Optional[str] = None,
-    model: str = "gpt-4o-mini",
     progress_callback: Optional[Callable[[str], None]] = None,
+    **_: object,
 ) -> str:
-    """Run the crawler/extractor and write the Excel workbook.
-
-    This function is used by both the command-line entry point and the
-    Windows-friendly Tkinter GUI.
-    """
     def report(message: str) -> None:
         print(message)
         if progress_callback:
             progress_callback(message)
 
-    client = OpenAI(api_key=api_key) if api_key else None
-    inputs = read_input_file(input_path)
+    start_time = datetime.now(timezone.utc)
     candidate_rows: List[Dict[str, object]] = []
-    programme_rows: List[Dict[str, str]] = []
-    log_rows: List[Dict[str, object]] = []
+    warnings: List[str] = []
+    error_details = ""
+    status = "Completed"
+    pages_visited = 0
+    universities_processed = 0
 
-    report(f"Loaded {len(inputs)} university row(s) from {input_path}")
-    for _, source in inputs.iterrows():
-        university = str(source.get("University", "")).strip()
-        start_url = str(source.get("Start URL", "")).strip()
-        report(f"Starting {university or '(missing university name)'}")
-        status = "Completed"
-        error_parts: List[str] = []
-        candidates: List[PageResult] = []
-        pages_visited = 0
-        try:
-            if not university or not start_url:
-                raise ValueError("University and Start URL are required for each input row")
-            candidates, pages_visited, crawl_error = crawl_university(university, start_url)
-            if crawl_error:
-                error_parts.append(crawl_error)
+    try:
+        targets = read_targets(input_path)
+        report(f"Loaded {len(targets)} university row(s) from {input_path}")
+        for target in targets:
+            report(f"Crawling {target.name} ({target.allowed_domain})")
+            universities_processed += 1
+            candidates, visited_count, university_warnings = crawl_university(target)
+            pages_visited += visited_count
+            warnings.extend([f"{target.name}: {warning}" for warning in university_warnings])
             for page in candidates:
                 candidate_rows.append({
-                    "University": university, "Page Title": page.title, "URL": page.url,
-                    "Relevance Score": page.score, "Found Keywords": page.found_keywords,
-                    "Reason": page.reason, "PDF Links": page.pdf_links, "Notes": page.notes,
+                    "University Name": page.university_name,
+                    "Country": page.country,
+                    "URL": page.url,
+                    "Page Title": page.title,
+                    "Candidate Score": page.score,
+                    "Matched Keywords": ", ".join(page.matched_keywords),
+                    "Candidate Type": page.candidate_type,
+                    "Reason": page.reason,
+                    "Needs Review": page.needs_review,
                 })
-            extraction_pages = [p for p in candidates if p.score >= RELEVANCE_THRESHOLD]
-            if not extraction_pages:
-                extraction_pages = candidates[:3]
-            if client:
-                for page in extraction_pages:
-                    if page.score < 20:
-                        continue
-                    report(f"Extracting programme data from {page.url}")
-                    rows, extract_error = extract_programmes_with_openai(client, model, university, page)
-                    programme_rows.extend(rows)
-                    if extract_error:
-                        error_parts.append(f"{page.url}: {extract_error}")
-            else:
-                error_parts.append("OPENAI_API_KEY not set; skipped OpenAI extraction")
-                status = "Completed with warnings"
-        except Exception as exc:
-            status = "Failed"
-            error_parts.append(str(exc))
-        log_rows.append({
-            "University": university, "Start URL": start_url, "Status": status,
-            "Pages Visited": pages_visited, "Candidate Pages Found": len(candidates),
-            "Programmes Extracted": len([r for r in programme_rows if r.get("University") == university]),
-            "Error Message": " | ".join(error_parts),
-            "Run DateTime": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        })
-        report(f"Finished {university}: {status}; {len(candidates)} candidate page(s)")
+            report(f"Finished {target.name}: visited {visited_count}, found {len(candidates)} candidate page(s)")
+        if warnings:
+            status = "Completed with warnings"
+    except Exception as exc:
+        status = "Failed"
+        error_details = str(exc)
+
+    end_time = datetime.now(timezone.utc)
+    run_log_row = {
+        "Start Time": start_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "End Time": end_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "Universities Processed": universities_processed,
+        "Pages Visited": pages_visited,
+        "Candidate Pages Found": len(candidate_rows),
+        "Status": status,
+        "Warnings": " | ".join(warnings[:20]),
+        "Error Details, if any": error_details,
+    }
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         pd.DataFrame(candidate_rows, columns=CANDIDATE_COLUMNS).to_excel(writer, sheet_name="Candidate Pages", index=False)
-        pd.DataFrame(programme_rows, columns=OUTPUT_PROGRAMME_COLUMNS).to_excel(writer, sheet_name="Extracted Programmes", index=False)
-        pd.DataFrame(log_rows, columns=RUN_LOG_COLUMNS).to_excel(writer, sheet_name="Run Log", index=False)
+        pd.DataFrame([run_log_row], columns=RUN_LOG_COLUMNS).to_excel(writer, sheet_name="Run Log", index=False)
     report(f"Wrote {output_path}")
     return output_path
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Crawl university sites and extract inbound short-term programme information.")
-    parser.add_argument("--input", default=os.getenv("INPUT_FILE", INPUT_FILE), help="Path to input_urls.xlsx")
+    parser = argparse.ArgumentParser(description="Collect candidate inbound/short-term programme pages from university websites.")
+    parser.add_argument("--input", default=os.getenv("INPUT_FILE", INPUT_FILE), help="Path to target_universities.csv")
     parser.add_argument("--output", default=os.getenv("OUTPUT_FILE", OUTPUT_FILE), help="Path for output_programmes.xlsx")
-    parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), help="OpenAI model name")
-    parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY"), help="OpenAI API key. Defaults to OPENAI_API_KEY.")
     return parser.parse_args()
 
 
 def main() -> None:
-    load_dotenv()
     args = parse_args()
-    run_scraper(input_path=args.input, output_path=args.output, api_key=args.api_key, model=args.model)
+    run_scraper(input_path=args.input, output_path=args.output)
 
 
 if __name__ == "__main__":
