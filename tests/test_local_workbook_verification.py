@@ -94,6 +94,17 @@ class LocalWorkbookVerificationTest(unittest.TestCase):
             self.assertEqual(programmes.loc[0, "Review Status"], "Needs human review")
             self.assertIn("Programme Dates", programmes.loc[0, "Missing Fields"])
 
+    def test_input_read_failure_does_not_create_output_workbook(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "output_programmes.xlsx"
+            input_path = Path(tmpdir) / "input_urls_template.xlsx"
+            input_path.write_bytes(b"PK\x03\x04 fake xlsx bytes \x98")
+
+            with self.assertRaisesRegex(ValueError, "Excel input is not supported yet"):
+                scraper.run_scraper(input_path=str(input_path), output_path=str(output_path))
+
+            self.assertFalse(output_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

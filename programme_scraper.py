@@ -10,6 +10,7 @@ import argparse
 import csv
 import os
 import re
+from pathlib import Path
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -460,6 +461,9 @@ def format_workbook(writer: pd.ExcelWriter, sheet_columns: Dict[str, List[str]])
 
 
 def read_targets(input_path: str) -> List[UniversityTarget]:
+    path = Path(input_path)
+    if path.suffix.lower() == ".xlsx":
+        raise ValueError("Please select target_universities.csv. Excel input is not supported yet.")
     with open(input_path, newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         missing = [column for column in INPUT_COLUMNS if column not in (reader.fieldnames or [])]
@@ -508,9 +512,10 @@ def run_scraper(
     universities_with_extracted_programmes = 0
     duplicate_rows = 0
 
+    targets = read_targets(input_path)
+    report(f"Loaded {len(targets)} university row(s) from {input_path}")
+
     try:
-        targets = read_targets(input_path)
-        report(f"Loaded {len(targets)} university row(s) from {input_path}")
         for target in targets:
             report(f"Crawling {target.name} ({target.allowed_domain})")
             universities_processed += 1

@@ -39,7 +39,7 @@ class ScraperApp(tk.Tk):
         frame.pack(fill="both", expand=True, padx=12, pady=12)
         frame.columnconfigure(1, weight=1)
 
-        ttk.Label(frame, text="Input Excel file").grid(row=0, column=0, sticky="w", **padding)
+        ttk.Label(frame, text="Input CSV file").grid(row=0, column=0, sticky="w", **padding)
         ttk.Entry(frame, textvariable=self.input_file).grid(row=0, column=1, sticky="ew", **padding)
         ttk.Button(frame, text="Browse...", command=self._pick_input).grid(row=0, column=2, **padding)
 
@@ -63,8 +63,8 @@ class ScraperApp(tk.Tk):
 
     def _pick_input(self) -> None:
         path = filedialog.askopenfilename(
-            title="Select input_urls.xlsx",
-            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
+            title="Select target_universities.csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
         )
         if path:
             self.input_file.set(path)
@@ -73,6 +73,18 @@ class ScraperApp(tk.Tk):
         path = filedialog.askdirectory(title="Select output folder")
         if path:
             self.output_folder.set(path)
+
+    def _validate_input_file(self, input_path: str) -> str | None:
+        path = Path(input_path)
+        if path.suffix.lower() == ".xlsx":
+            return "Please select target_universities.csv. Excel input is not supported yet."
+        if path.suffix.lower() != ".csv":
+            return "Please select a CSV input file named target_universities.csv."
+        if not path.exists():
+            return f"Input CSV file does not exist: {input_path}"
+        if not path.is_file():
+            return f"Input CSV path is not a file: {input_path}"
+        return None
 
     def _append_log(self, message: str) -> None:
         self.log.configure(state="normal")
@@ -87,7 +99,12 @@ class ScraperApp(tk.Tk):
         model = self.model.get().strip() or "gpt-4o-mini"
 
         if not input_path:
-            messagebox.showerror("Missing input", "Please choose input_urls.xlsx.")
+            messagebox.showerror("Missing input", "Please choose target_universities.csv.")
+            return
+        validation_error = self._validate_input_file(input_path)
+        if validation_error:
+            self._append_log(f"Input validation failed: {validation_error}")
+            messagebox.showerror("Invalid input file", validation_error)
             return
         if not output_folder:
             messagebox.showerror("Missing output folder", "Please choose an output folder.")
